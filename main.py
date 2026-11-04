@@ -8,6 +8,7 @@ import urllib.parse
 import os
 import json
 import datetime
+import re
 import aiomax
 from aiomax import Bot
 
@@ -39,11 +40,24 @@ ROLE_PROMPTS = {
 }
 
 # ============================================================
-# СЛОВАРЬ УРОКОВ
+# УРОКИ И ТЕМЫ
+# Структура: { урок: { тема: ссылка_на_изображение } }
 # ============================================================
 
 lessons = {
-    "физика": "https://drive.google.com/file/d/1lpKCsDmLqqDG_FWwOkBtq6ENE9UWxD3p/view?usp=drive_link",
+    "физика": {
+        "общее": "https://drive.google.com/file/d/1bOzF5M1CZtMIzJLFROGl_GBJzC_nxvCs/view?usp=drive_link",
+        "работа со стеклом": "https://drive.google.com/file/d/1RZUuUSNa9HuL4PsyiPt4pIVjx0zjt_DC/view?usp=drive_link",
+        "работа с весами": "https://drive.google.com/file/d/1CVbvr5rhEMt-RsvGlN_YmXCS7AWYaaBB/view?usp=drive_link",
+        "работа с горячими вещами": "https://drive.google.com/file/d/10uso0bIDi8mpe1JJ9a_PlJLoo-8Z4Bw1/view?usp=drive_link",
+        "работа с электричеством": "https://drive.google.com/file/d/1PB-AIW29EVgn3wf1JI8evkcUHqXrjFTL/view?usp=drive_link",
+        "работа с оптикой": "https://drive.google.com/file/d/1s3Giu33mZNPRd4QVvXyyWI2Ni8gf4YXX/view?usp=drive_link",
+        "действия при ЧС": "https://drive.google.com/file/d/1IfDJ_v0PBNOscoiM-mn7eS1grvYxLZhh/view?usp=drive_link",
+    },
+    "математика": {
+        "Алгебра": "https://drive.google.com/file/d/example_algebra/view",
+        "Геометрия": "https://drive.google.com/file/d/example_geometry/view",
+    },
 }
 
 # ============================================================
@@ -55,7 +69,12 @@ bot = Bot(MAX_TOKEN, default_format="markdown", use_certificate=True)
 user_states = {}
 pending_users = {}
 active_tests = {}
-greeted_admins = set()  # админы, которым меню уже показано в этой сессии
+greeted_admins = set()
+pending_notifications = {}
+
+# Кэш токена и file_id изображений
+_token_cache = {"token": None, "expires": None}
+_image_file_id_cache = {}  # url -> file_id
 
 
 def set_user_state(user_id: int, state: str | None, data: dict | None = None):
@@ -178,7 +197,16 @@ def get_all_admins() -> list[int]:
 # GIGACHAT API
 # ============================================================
 
-async def get_sber_oauth_token() -> str | None:
+async def get_sber_oauth_token(force_refresh: bool = False) -> str | None:
+    now = datetime.datetime.now()
+    if (
+        not force_refresh
+        and _token_cache["token"]
+        and _token_cache["expires"]
+        and now < _token_cache["expires"]
+    ):
+        return _token_cache["token"]
+
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     headers = {
         "Authorization": f"Basic {GIGACHAT_CREDENTIALS}",
@@ -196,7 +224,11 @@ async def get_sber_oauth_token() -> str | None:
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return data.get("access_token")
+                    token = data.get("access_token")
+                    if token:
+                        _token_cache["token"] = token
+                        _token_cache["expires"] = now + datetime.timedelta(minutes=25)
+                    return token
                 err_text = await resp.text()
                 print(f"Ответ Сбера (Статус {resp.status}): {err_text}")
                 return None
@@ -234,6 +266,133 @@ async def ask_gigachat(user_message: str, system_prompt: str) -> str:
                 return f"Сбер вернул ошибку {resp.status}: {err_text}"
         except Exception as e:
             return f"Ошибка сети при генерации ответа: {e}"
+
+
+async def upload_file_to_gigachat(
+    image_bytes: bytes,
+    filename: str,
+    content_type: str,
+) -> str | None:
+    """Загрузить файл в хранилище GigaChat. Возвращает file_id."""
+    token = await get_sber_oauth_token()
+    if not token:
+        return None
+
+    url = "https://api.giga.chat/v1/files"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    form = aiohttp.FormData()
+    form.add_field("purpose", "general")
+    form.add_field("file", image_bytes, filename=filename, content_type=content_type)
+
+    timeout = aiohttp.ClientTimeout(total=60, sock_connect=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            async with session.post(url, headers=headers, data=form, ssl=False) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("id")
+                err = await resp.text()
+                print(f"⬆ [upload] ошибка {resp.status}: {err[:300]}")
+                return None
+        except Exception as e:
+            print(f"⬆ [upload] исключение: {e}")
+            return None
+
+
+async def ask_gigachat_with_image(
+    prompt: str,
+    system_prompt: str,
+    file_id: str,
+) -> str:
+    """Отправить в GigaChat запрос с изображением (через attachments)."""
+    token = await get_sber_oauth_token()
+    if not token:
+        return "Не удалось пройти авторизацию в системе GigaChat API."
+
+    url = "https://api.giga.chat/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Authorization": f"Bearer {token}",
+    }
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt, "attachments": [file_id]},
+        ],
+        "temperature": 0.5,
+    }
+
+    async with aiohttp.ClientSession(timeout=GIGACHAT_TIMEOUT) as session:
+        try:
+            async with session.post(url, headers=headers, json=payload, ssl=False) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data["choices"][0]["message"]["content"]
+                err_text = await resp.text()
+                return f"Сбер вернул ошибку {resp.status}: {err_text}"
+        except Exception as e:
+            return f"Ошибка сети при генерации ответа: {e}"
+
+
+# ============================================================
+# СКАЧИВАНИЕ ИЗОБРАЖЕНИЯ
+# ============================================================
+
+def _normalize_image_url(url: str) -> str:
+    """Превращает Google Drive view-ссылки в прямые ссылки на скачивание."""
+    url = url.strip()
+    if "drive.google.com" in url and "/file/d/" in url:
+        m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
+        if m:
+            file_id = m.group(1)
+            return f"https://drive.google.com/uc?export=download&id={file_id}"
+    return url
+
+
+async def download_image(url: str) -> tuple[bytes, str, str] | None:
+    """Скачать изображение. Возвращает (bytes, content_type, filename) или None."""
+    normalized = _normalize_image_url(url)
+    timeout = aiohttp.ClientTimeout(total=60, sock_connect=15)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            async with session.get(normalized, allow_redirects=True, ssl=False) as resp:
+                if resp.status != 200:
+                    print(f"⬇ [image] HTTP {resp.status} для {normalized[:120]}")
+                    return None
+
+                content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+                data = await resp.read()
+
+                if len(data) > 20 * 1024 * 1024:
+                    print(f"⬇ [image] файл слишком большой: {len(data)} байт")
+                    return None
+                if len(data) < 100:
+                    print(f"⬇ [image] файл слишком маленький: {len(data)} байт")
+                    return None
+
+                if not content_type.startswith("image/"):
+                    print(
+                        f"⬇ [image] Content-Type не изображение: {content_type}. "
+                        f"Возможно, ссылка ведёт на страницу, а не на файл."
+                    )
+                    return None
+
+                ext_map = {
+                    "image/jpeg": "jpg",
+                    "image/png": "png",
+                    "image/webp": "webp",
+                    "image/gif": "gif",
+                    "image/bmp": "bmp",
+                }
+                ext = ext_map.get(content_type, "jpg")
+                filename = f"topic_image.{ext}"
+                return data, content_type, filename
+        except Exception as e:
+            print(f"⬇ [image] исключение: {e}")
+            return None
 
 
 # ============================================================
@@ -406,37 +565,8 @@ async def notify_all_students(text: str):
 # ============================================================
 
 async def clear_buttons_after_callback(cb, text: str) -> bool:
-    """
-    Ответить на callback и попытаться убрать кнопки с исходного сообщения.
-    Пробует несколько способов (разные версии aiomax поддерживают разное).
-    """
-    # Способ 1: keyboard=None — в большинстве версий означает "без клавиатуры"
-    try:
-        await cb.answer(text=text, keyboard=None)
-        print("🔘 [buttons] cleared via keyboard=None")
-        return True
-    except TypeError as e:
-        print(f"🔘 [buttons] keyboard=None: TypeError {e}")
-    except Exception as e:
-        print(f"🔘 [buttons] keyboard=None failed: {e}")
+    admin_id = extract_callback_user_id(cb)
 
-    # Способ 2: attachments=[] (не работает в некоторых версиях)
-    try:
-        await cb.answer(text=text, attachments=[])
-        print("🔘 [buttons] cleared via attachments=[]")
-        return True
-    except Exception as e:
-        print(f"🔘 [buttons] attachments=[] failed: {e}")
-
-    # Способ 3: оба вместе
-    try:
-        await cb.answer(text=text, keyboard=None, attachments=[])
-        print("🔘 [buttons] cleared via keyboard=None + attachments=[]")
-        return True
-    except Exception as e:
-        print(f"🔘 [buttons] both failed: {e}")
-
-    # Способ 4: прямое редактирование/удаление сообщения через bot
     msg = getattr(cb, "message", None)
     msg_id = None
     if msg is not None:
@@ -445,49 +575,105 @@ async def clear_buttons_after_callback(cb, text: str) -> bool:
             or getattr(msg, "id", None)
             or getattr(getattr(msg, "body", None), "mid", None)
         )
-    if msg_id:
-        for method_name in ("edit_message", "edit", "update_message"):
-            method = getattr(bot, method_name, None)
-            if method is None:
-                continue
-            try:
-                await method(message_id=msg_id, text=text, attachments=[])
-                print(f"🔘 [buttons] cleared via bot.{method_name}")
-                return True
-            except TypeError:
-                try:
-                    await method(msg_id, text=text)
-                    print(f"🔘 [buttons] cleared via bot.{method_name}(pos)")
-                    return True
-                except Exception as e:
-                    print(f"🔘 [buttons] bot.{method_name} (pos) failed: {e}")
-            except Exception as e:
-                print(f"🔘 [buttons] bot.{method_name} failed: {e}")
 
+    if msg_id:
+        deleted = False
         for method_name in ("delete_message", "remove_message"):
             method = getattr(bot, method_name, None)
             if method is None:
                 continue
             try:
                 await method(message_id=msg_id)
-                print(f"🔘 [buttons] message deleted via bot.{method_name}")
-                admin_id = extract_callback_user_id(cb)
-                if admin_id:
-                    try:
-                        await bot.send_message(text=text, user_id=admin_id)
-                    except Exception as e:
-                        print(f"🔘 [buttons] send confirmation failed: {e}")
-                return True
+                print(f"🔘 [buttons] deleted message {msg_id} via bot.{method_name}")
+                deleted = True
+                break
             except Exception as e:
                 print(f"🔘 [buttons] bot.{method_name} failed: {e}")
 
-    # Фолбэк: хотя бы текст
+        if deleted and admin_id:
+            try:
+                await bot.send_message(text=text, user_id=admin_id)
+                print(f"🔘 [buttons] sent new clean message to admin {admin_id}")
+                return True
+            except Exception as e:
+                print(f"🔘 [buttons] send new failed: {e}")
+
+    for kwargs in (
+        {"text": text, "keyboard": None},
+        {"text": text, "attachments": []},
+        {"text": text, "keyboard": None, "attachments": []},
+    ):
+        try:
+            await cb.answer(**kwargs)
+            print(f"🔘 [buttons] fallback cb.answer({list(kwargs.keys())})")
+            return True
+        except Exception as e:
+            print(f"🔘 [buttons] cb.answer failed: {e}")
+
     try:
         await cb.answer(text=text)
         print("🔘 [buttons] text-only (buttons may remain)")
     except Exception as e:
         print(f"🔘 [buttons] text-only failed: {e}")
     return False
+
+
+# ============================================================
+# УДАЛЕНИЕ УВЕДОМЛЕНИЯ У ВСЕХ АДМИНОВ
+# ============================================================
+
+def _extract_message_id(result) -> int | str | None:
+    if result is None:
+        return None
+    if isinstance(result, (int, str)):
+        return result
+    for attr in ("message_id", "id", "mid"):
+        val = getattr(result, attr, None)
+        if val:
+            return val
+    body = getattr(result, "body", None)
+    if body is not None:
+        for attr in ("message_id", "mid", "id"):
+            val = getattr(body, attr, None)
+            if val:
+                return val
+    return None
+
+
+async def hide_admin_notification_for_all(
+    new_user_id: int,
+    result_text: str,
+    skip_admin_id: int | None = None,
+):
+    entries = pending_notifications.pop(new_user_id, [])
+    if not entries:
+        return
+
+    for admin_id, msg_id in entries:
+        if skip_admin_id is not None and admin_id == skip_admin_id:
+            continue
+        if not msg_id:
+            print(f"🧹 [hide] нет message_id для админа {admin_id} — пропускаем")
+            continue
+
+        deleted = False
+        for method_name in ("delete_message", "remove_message"):
+            method = getattr(bot, method_name, None)
+            if method is None:
+                continue
+            try:
+                await method(message_id=msg_id)
+                print(f"🧹 [hide] удалено сообщение {msg_id} у админа {admin_id}")
+                deleted = True
+                break
+            except Exception as e:
+                print(f"🧹 [hide] {method_name} для {admin_id}: {e}")
+
+        if not deleted:
+            print(
+                f"🧹 [hide] ⚠ не удалось удалить сообщение {msg_id} у админа {admin_id}. "
+                f"Проверьте, поддерживает ли ваша версия aiomax bot.delete_message."
+            )
 
 
 # ============================================================
@@ -506,12 +692,19 @@ async def notify_admins_about_new_user(user_id: int, user_name: str):
         f"🆔 ID: `{user_id}`\n\n"
         f"Кем его сделать?"
     )
+    pending_notifications.setdefault(user_id, [])
     for admin_id in admin_ids:
         try:
             kb = aiomax.buttons.KeyboardBuilder()
             kb.add(aiomax.buttons.CallbackButton("📚 Ученик", f"admin_assign:{user_id}:student"))
             kb.add(aiomax.buttons.CallbackButton("👨‍🏫 Учитель", f"admin_assign:{user_id}:teacher"))
-            await bot.send_message(text=text, user_id=admin_id, keyboard=kb)
+            result = await bot.send_message(text=text, user_id=admin_id, keyboard=kb)
+            msg_id = _extract_message_id(result)
+            if msg_id:
+                pending_notifications[user_id].append((admin_id, msg_id))
+                print(f"🧷 [notify] сохранил message_id={msg_id} для админа {admin_id}")
+            else:
+                print(f"🧷 [notify] не удалось получить message_id для админа {admin_id}")
             log_outgoing(f"админ {admin_id}", text)
             await asyncio.sleep(0.05)
         except Exception as e:
@@ -555,17 +748,46 @@ def build_back_keyboard():
 
 
 def build_lessons_keyboard(prefix: str):
+    """Кнопки уроков (верхний уровень lessons)."""
     if not lessons:
         return None
     kb = aiomax.buttons.KeyboardBuilder()
     count = 0
-    for key in lessons:
-        if not key:
+    for lesson_name in lessons:
+        if not lesson_name:
             continue
-        kb.add(aiomax.buttons.CallbackButton(key, f"{prefix}:{key}"))
+        kb.add(aiomax.buttons.CallbackButton(lesson_name, f"{prefix}:{lesson_name}"))
         count += 1
         if count % 3 == 0:
             kb.row()
+    return kb if count > 0 else None
+
+
+def build_topics_keyboard(lesson_name: str, prefix: str, back_payload: str):
+    """
+    Кнопки тем для выбранного урока + кнопка «Назад».
+    prefix: m_topic / t_topic
+    back_payload: m_back / t_back
+    """
+    topics = lessons.get(lesson_name)
+    if not isinstance(topics, dict) or not topics:
+        return None
+
+    kb = aiomax.buttons.KeyboardBuilder()
+    count = 0
+    for topic in topics:
+        if not topic:
+            continue
+        kb.add(aiomax.buttons.CallbackButton(topic, f"{prefix}:{lesson_name}:{topic}"))
+        count += 1
+        if count % 3 == 0:
+            kb.row()
+    if count == 0:
+        return None
+
+    if count % 3 != 0:
+        kb.row()
+    kb.add(aiomax.buttons.CallbackButton("⬅ Назад", back_payload))
     return kb
 
 
@@ -577,7 +799,7 @@ def build_question_keyboard(index: int):
 
 
 # ============================================================
-# ГЕНЕРАЦИЯ ТЕСТА
+# ГЕНЕРАЦИЯ ТЕСТА (ПО ТЕКСТУ) — не используется, оставлена на будущее
 # ============================================================
 
 async def generate_test(subject: str) -> list[dict] | None:
@@ -591,6 +813,71 @@ async def generate_test(subject: str) -> list[dict] | None:
     )
     system = "Ты — составитель тестов. Отвечай только валидным JSON."
     raw = await ask_gigachat(prompt, system)
+
+    start = raw.find("[")
+    end = raw.rfind("]")
+    if start == -1 or end == -1:
+        print(f"Не удалось найти JSON в ответе: {raw[:300]}")
+        return None
+    try:
+        data = json.loads(raw[start:end + 1])
+    except json.JSONDecodeError as e:
+        print(f"Ошибка парсинга JSON: {e}\nОтвет: {raw[:500]}")
+        return None
+
+    if not isinstance(data, list) or len(data) != 10:
+        print(f"Ожидался список из 10 вопросов, получено: type={type(data)}")
+        return None
+    for item in data:
+        if not isinstance(item, dict) or "question" not in item or "correct" not in item:
+            print("Неверная структура вопроса")
+            return None
+    return data
+
+
+# ============================================================
+# ГЕНЕРАЦИЯ ТЕСТА (ПО ИЗОБРАЖЕНИЮ)
+# ============================================================
+
+async def generate_test_from_image(image_url: str, subject: str) -> list[dict] | None:
+    """Скачать изображение → загрузить в GigaChat → сгенерировать тест по нему."""
+
+    file_id = _image_file_id_cache.get(image_url)
+
+    if not file_id:
+        print(f"⬇ [test] скачиваю изображение по теме «{subject}»")
+        dl = await download_image(image_url)
+        if not dl:
+            print("❌ [test] не удалось скачать изображение")
+            return None
+        image_bytes, content_type, filename = dl
+        print(f"⬇ [test] скачано {len(image_bytes)} байт, тип {content_type}")
+
+        print("⬆ [test] загружаю изображение в GigaChat")
+        file_id = await upload_file_to_gigachat(image_bytes, filename, content_type)
+        if not file_id:
+            print("❌ [test] не удалось загрузить изображение в GigaChat")
+            return None
+        print(f"⬆ [test] file_id={file_id}")
+        _image_file_id_cache[image_url] = file_id
+    else:
+        print(f"♻ [test] использую кэшированный file_id={file_id}")
+
+    prompt = (
+        f"Внимательно изучи изображение по теме «{subject}». "
+        f"Составь тест из 10 вопросов на основе материала с изображения. "
+        "Каждый вопрос должен иметь два варианта ответа: «Верно» и «Неверно». "
+        "Укажи правильный ответ для каждого вопроса. "
+        "Верни ответ строго в формате JSON-массива объектов с полями: "
+        "\"question\" (текст вопроса) и \"correct\" (строка \"true\" или \"false\"). "
+        "Не добавляй никаких пояснений, только JSON."
+    )
+    system = "Ты — составитель тестов. Отвечай только валидным JSON."
+    raw = await ask_gigachat_with_image(prompt, system, file_id)
+
+    if raw.startswith("Сбер вернул ошибку") or raw.startswith("Ошибка сети") or raw.startswith("Не удалось"):
+        print(f"❌ [test] GigaChat вернул ошибку: {raw[:300]}")
+        return None
 
     start = raw.find("[")
     end = raw.rfind("]")
@@ -670,12 +957,10 @@ async def ai_handler(message):
 
         role = get_user_role(user_id)
 
-        # Новый пользователь — отправляем заявку админам
         if role is None:
             await try_request_access(message, user_id, user_name)
             return
 
-        # Админ: при первом сообщении в сессии показываем меню с приветствием
         if role == "admin" and user_id not in greeted_admins:
             greeted_admins.add(user_id)
             if user_text.strip().lower() not in ("/menu", "меню", "/start", "старт"):
@@ -697,32 +982,28 @@ async def ai_handler(message):
             log_outgoing(user_name, answer_text)
             return
 
-        # Команда /start — меню для teacher/admin
         if role in ("teacher", "admin") and user_text.strip().lower() in ("/start", "старт"):
             kb = build_teacher_menu()
             await message.reply(text="📋 Меню:", keyboard=kb)
             log_outgoing(user_name, "меню по /start")
             return
 
-        # Команда /menu — меню для teacher/admin
         if role in ("teacher", "admin") and user_text.strip().lower() in ("/menu", "меню"):
             kb = build_teacher_menu()
             await message.reply(text="📋 Меню:", keyboard=kb)
             log_outgoing(user_name, "меню по /menu")
             return
 
-        # /test — быстрый выбор предмета для теста
         if role in ("teacher", "admin") and user_text.strip().lower() in ("/test", "тест", "задать тест"):
-            kb = build_lessons_keyboard(prefix="test_subject")
+            kb = build_lessons_keyboard(prefix="t_lesson")
             if kb is None:
                 await message.reply(text="📭 Список уроков пуст. Добавь предметы в словарь `lessons`.")
                 log_outgoing(user_name, "Список уроков пуст")
             else:
-                await message.reply(text="📝 Выберите предмет для теста:", keyboard=kb)
-                log_outgoing(user_name, "Выбор предмета для теста")
+                await message.reply(text="📝 Выберите урок для теста:", keyboard=kb)
+                log_outgoing(user_name, "Выбор урока для теста")
             return
 
-        # Обычный ответ через GigaChat
         if role in ("teacher", "admin"):
             system_prompt = ROLE_PROMPTS["teacher"]
         else:
@@ -766,23 +1047,21 @@ async def admin_assign_callback(cb: aiomax.Callback):
         if get_user_role(new_user_id) is not None:
             pending_users.pop(new_user_id, None)
             await clear_buttons_after_callback(
-                cb,
-                f"⚠ Пользователю {new_user_id} уже назначена роль.",
+                cb, f"⚠ Пользователю {new_user_id} уже назначена роль.",
             )
             return
 
-        # Назначаем роль
         set_user_role(new_user_id, new_role)
         pending_users.pop(new_user_id, None)
         role_ru = "Учитель" if new_role == "teacher" else "Ученик"
+        result_text = f"✅ Пользователь {new_user_id} назначен: **{role_ru}**."
 
-        await clear_buttons_after_callback(
-            cb,
-            f"✅ Пользователь {new_user_id} назначен: **{role_ru}**.",
+        await hide_admin_notification_for_all(
+            new_user_id, result_text, skip_admin_id=admin_id,
         )
+        await clear_buttons_after_callback(cb, result_text)
         print(f"👑 Админ {admin_id} назначил пользователю {new_user_id} роль: {new_role}")
 
-        # Уведомляем пользователя
         try:
             await bot.send_message(
                 text=f"✅ Вам назначена роль: **{role_ru}**. Теперь можете пользоваться ботом.",
@@ -808,17 +1087,17 @@ async def admin_assign_callback(cb: aiomax.Callback):
 
 
 # ============================================================
-# МЕНЮ «МАТЕРИАЛЫ»
+# МАТЕРИАЛЫ: МЕНЮ → УРОКИ
 # ============================================================
 
 @bot.on_button_callback(lambda data: data.payload == "materials_menu")
 async def materials_menu_callback(cb: aiomax.Callback):
     try:
-        kb = build_lessons_keyboard(prefix="lesson")
+        kb = build_lessons_keyboard(prefix="m_lesson")
         if kb is None:
             await cb.answer(text="📭 Список уроков пуст.", keyboard=build_back_keyboard())
             return
-        await cb.answer(text="📚 Выберите предмет:", keyboard=kb)
+        await cb.answer(text="📚 Выберите урок:", keyboard=kb)
     except Exception as e:
         print(f"Ошибка в меню «Материалы»: {e}")
         try:
@@ -828,23 +1107,56 @@ async def materials_menu_callback(cb: aiomax.Callback):
 
 
 # ============================================================
-# РАССЫЛКА МАТЕРИАЛОВ
+# МАТЕРИАЛЫ: УРОК → ТЕМЫ
 # ============================================================
 
-@bot.on_button_callback(lambda data: data.payload.startswith("lesson:"))
-async def lesson_callback(cb: aiomax.Callback):
+@bot.on_button_callback(lambda data: data.payload.startswith("m_lesson:"))
+async def materials_lesson_callback(cb: aiomax.Callback):
     try:
-        lesson_key = cb.payload.split(":", 1)[1]
-        link = lessons.get(lesson_key, "").strip()
+        lesson_name = cb.payload.split(":", 1)[1]
+        if lesson_name not in lessons:
+            await cb.answer(text=f"⚠ Урок «{lesson_name}» не найден.", keyboard=build_back_keyboard())
+            return
+
+        kb = build_topics_keyboard(lesson_name, prefix="m_topic", back_payload="m_back")
+        if kb is None:
+            await cb.answer(
+                text=f"📭 У урока «{lesson_name}» нет тем.",
+                keyboard=build_back_keyboard(),
+            )
+            return
+        await cb.answer(text=f"📚 Урок «{lesson_name}». Выберите тему:", keyboard=kb)
+    except Exception as e:
+        print(f"Ошибка в materials_lesson_callback: {e}")
+        try:
+            await cb.answer(text="❌ Ошибка.", keyboard=build_back_keyboard())
+        except Exception:
+            pass
+
+
+# ============================================================
+# МАТЕРИАЛЫ: ТЕМА → РАССЫЛКА
+# ============================================================
+
+@bot.on_button_callback(lambda data: data.payload.startswith("m_topic:"))
+async def materials_topic_callback(cb: aiomax.Callback):
+    try:
+        parts = cb.payload.split(":", 2)
+        if len(parts) != 3:
+            await cb.answer(text="❌ Некорректные данные темы.", keyboard=build_back_keyboard())
+            return
+        _, lesson_name, topic = parts
+        topics = lessons.get(lesson_name, {})
+        link = topics.get(topic, "").strip() if isinstance(topics, dict) else ""
 
         if not link:
             await cb.answer(
-                text=f"⚠ Урок «{lesson_key}» найден, но ссылка не задана.",
+                text=f"⚠ Тема «{topic}» найдена, но ссылка не задана.",
                 keyboard=build_back_keyboard(),
             )
             return
 
-        broadcast_text = f"📚 Новый урок: **{lesson_key}**\n🔗 {link}"
+        broadcast_text = f"📚 Новый урок: **{lesson_name} — {topic}**\n🔗 {link}"
         ok, fail = await notify_all_students(broadcast_text)
 
         await cb.answer(
@@ -852,18 +1164,31 @@ async def lesson_callback(cb: aiomax.Callback):
             keyboard=build_back_keyboard(),
         )
     except Exception as e:
-        print(f"Ошибка в обработчике кнопки урока: {e}")
+        print(f"Ошибка в materials_topic_callback: {e}")
         try:
-            await cb.answer(
-                text="❌ Произошла ошибка при рассылке.",
-                keyboard=build_back_keyboard(),
-            )
+            await cb.answer(text="❌ Ошибка при рассылке.", keyboard=build_back_keyboard())
         except Exception:
             pass
 
 
 # ============================================================
-# ВОЗВРАТ В МЕНЮ
+# МАТЕРИАЛЫ: НАЗАД К УРОКАМ
+# ============================================================
+
+@bot.on_button_callback(lambda data: data.payload == "m_back")
+async def materials_back_callback(cb: aiomax.Callback):
+    try:
+        kb = build_lessons_keyboard(prefix="m_lesson")
+        if kb is None:
+            await cb.answer(text="📭 Список уроков пуст.", keyboard=build_back_keyboard())
+            return
+        await cb.answer(text="📚 Выберите урок:", keyboard=kb)
+    except Exception as e:
+        print(f"Ошибка в materials_back_callback: {e}")
+
+
+# ============================================================
+# ВОЗВРАТ В ГЛАВНОЕ МЕНЮ
 # ============================================================
 
 @bot.on_button_callback(lambda data: data.payload == "back_to_menu")
@@ -876,17 +1201,17 @@ async def back_to_menu_callback(cb: aiomax.Callback):
 
 
 # ============================================================
-# МЕНЮ «ТЕСТ»
+# ТЕСТЫ: МЕНЮ → УРОКИ
 # ============================================================
 
 @bot.on_button_callback(lambda data: data.payload == "test_menu")
 async def test_menu_callback(cb: aiomax.Callback):
     try:
-        kb = build_lessons_keyboard(prefix="test_subject")
+        kb = build_lessons_keyboard(prefix="t_lesson")
         if kb is None:
             await cb.answer(text="📭 Список уроков пуст.", keyboard=build_back_keyboard())
             return
-        await cb.answer(text="📝 Выберите предмет для теста:", keyboard=kb)
+        await cb.answer(text="📝 Выберите урок для теста:", keyboard=kb)
     except Exception as e:
         print(f"Ошибка в меню «Тест»: {e}")
         try:
@@ -896,19 +1221,73 @@ async def test_menu_callback(cb: aiomax.Callback):
 
 
 # ============================================================
-# ГЕНЕРАЦИЯ И РАССЫЛКА ТЕСТА
+# ТЕСТЫ: УРОК → ТЕМЫ
 # ============================================================
 
-@bot.on_button_callback(lambda data: data.payload.startswith("test_subject:"))
-async def test_subject_callback(cb: aiomax.Callback):
+@bot.on_button_callback(lambda data: data.payload.startswith("t_lesson:"))
+async def tests_lesson_callback(cb: aiomax.Callback):
     try:
-        subject = cb.payload.split(":", 1)[1]
-        await cb.answer(text=f"⏳ Составляю тест по предмету «{subject}»...")
+        lesson_name = cb.payload.split(":", 1)[1]
+        if lesson_name not in lessons:
+            await cb.answer(text=f"⚠ Урок «{lesson_name}» не найден.", keyboard=build_back_keyboard())
+            return
 
-        questions = await generate_test(subject)
+        kb = build_topics_keyboard(lesson_name, prefix="t_topic", back_payload="t_back")
+        if kb is None:
+            await cb.answer(
+                text=f"📭 У урока «{lesson_name}» нет тем.",
+                keyboard=build_back_keyboard(),
+            )
+            return
+        await cb.answer(
+            text=f"📝 Урок «{lesson_name}». Выберите тему для теста:",
+            keyboard=kb,
+        )
+    except Exception as e:
+        print(f"Ошибка в tests_lesson_callback: {e}")
+        try:
+            await cb.answer(text="❌ Ошибка.", keyboard=build_back_keyboard())
+        except Exception:
+            pass
+
+
+# ============================================================
+# ТЕСТЫ: ТЕМА → ГЕНЕРАЦИЯ ПО ИЗОБРАЖЕНИЮ
+# ============================================================
+
+@bot.on_button_callback(lambda data: data.payload.startswith("t_topic:"))
+async def tests_topic_callback(cb: aiomax.Callback):
+    try:
+        parts = cb.payload.split(":", 2)
+        if len(parts) != 3:
+            await cb.answer(text="❌ Некорректные данные темы.", keyboard=build_back_keyboard())
+            return
+        _, lesson_name, topic = parts
+        subject = f"{lesson_name} — {topic}"
+
+        topics = lessons.get(lesson_name, {})
+        image_url = topics.get(topic, "").strip() if isinstance(topics, dict) else ""
+        if not image_url:
+            await cb.answer(
+                text=f"⚠ У темы «{topic}» нет ссылки. Добавьте URL изображения в `lessons`.",
+                keyboard=build_back_keyboard(),
+            )
+            return
+
+        await cb.answer(text=f"⏳ Скачиваю изображение и составляю тест по теме «{subject}»...")
+
+        questions = await generate_test_from_image(image_url, subject)
         if questions is None:
             await cb.answer(
-                text="❌ Не удалось составить тест. Попробуйте позже.",
+                text=(
+                    "❌ Не удалось составить тест по изображению.\n\n"
+                    "Возможные причины:\n"
+                    "• ссылка ведёт не на картинку (а на страницу документа);\n"
+                    "• файл слишком большой (>20 МБ) или слишком маленький;\n"
+                    "• Google Drive-файл требует авторизации;\n"
+                    "• GigaChat временно недоступен.\n\n"
+                    "Проверьте ссылку и попробуйте снова."
+                ),
                 keyboard=build_back_keyboard(),
             )
             return
@@ -916,7 +1295,7 @@ async def test_subject_callback(cb: aiomax.Callback):
         active_tests[subject] = questions
 
         broadcast_text = (
-            f"📝 Доступен тест по предмету **{subject}**!\n"
+            f"📝 Доступен тест по теме **{subject}**!\n"
             f"Нажмите «▶ Начать тест», чтобы пройти 10 вопросов."
         )
 
@@ -956,11 +1335,27 @@ async def test_subject_callback(cb: aiomax.Callback):
             keyboard=build_back_keyboard(),
         )
     except Exception as e:
-        print(f"Ошибка в обработчике предмета теста: {e}")
+        print(f"Ошибка в tests_topic_callback: {e}")
         try:
             await cb.answer(text="❌ Ошибка при создании теста.", keyboard=build_back_keyboard())
         except Exception:
             pass
+
+
+# ============================================================
+# ТЕСТЫ: НАЗАД К УРОКАМ
+# ============================================================
+
+@bot.on_button_callback(lambda data: data.payload == "t_back")
+async def tests_back_callback(cb: aiomax.Callback):
+    try:
+        kb = build_lessons_keyboard(prefix="t_lesson")
+        if kb is None:
+            await cb.answer(text="📭 Список уроков пуст.", keyboard=build_back_keyboard())
+            return
+        await cb.answer(text="📝 Выберите урок для теста:", keyboard=kb)
+    except Exception as e:
+        print(f"Ошибка в tests_back_callback: {e}")
 
 
 # ============================================================
@@ -973,7 +1368,7 @@ async def start_test_callback(cb: aiomax.Callback):
         subject = cb.payload.split(":", 1)[1]
         questions = active_tests.get(subject)
         if not questions:
-            await cb.answer(text="❌ Тест по этому предмету ещё не создан.")
+            await cb.answer(text="❌ Тест по этой теме ещё не создан.")
             return
 
         user_id = extract_callback_user_id(cb)
@@ -1086,7 +1481,7 @@ async def answer_callback(cb: aiomax.Callback):
 
 
 # ============================================================
-# ПРОСМОТР РЕЗУЛЬТАТОВ (ДЛЯ УЧИТЕЛЯ / АДМИНА)
+# ПРОСМОТР РЕЗУЛЬТАТОВ
 # ============================================================
 
 @bot.on_button_callback(lambda data: data.payload == "results_view")
@@ -1146,6 +1541,8 @@ def main():
     init_vip_file()
     print("ИИ-агент для мессенджера MAX запущен.")
     print(f"Уроков в словаре: {len(lessons)}")
+    total_topics = sum(len(t) for t in lessons.values() if isinstance(t, dict))
+    print(f"Всего тем: {total_topics}")
 
     admins = get_all_admins()
     if admins:
